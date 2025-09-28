@@ -413,6 +413,7 @@ static int ramdisk_close(void *h) {
 /* Read from a file */
 static ssize_t ramdisk_read(void *h, void *buf, size_t bytes) {
     rd_fd_t     *fd = h;
+    size_t zero_bytes = 0;
 
     mutex_lock_scoped(&rd_mutex);
 
@@ -422,12 +423,19 @@ static ssize_t ramdisk_read(void *h, void *buf, size_t bytes) {
         return (ssize_t)-1;
     }
 
-    /* Is there enough left? */
-    if((fd->ptr + bytes) > fd->file->size)
-        bytes = fd->file->size - fd->ptr;
+    /* If we're starting within the file */
+    if(fd->ptr < fd->file->size) {
+        /* If we're going to overflow the file, so note the zero bytes to be written. */
+        if(fd->ptr + bytes > fd->file->size)
+            zero_bytes = bytes - (fd->file->size - fd->ptr);
 
-    /* Copy out the requested amount */
-    memcpy(buf, ((uint8_t *)fd->file->data) + fd->ptr, bytes);
+        memcpy(buf, ((uint8_t *)fd->file->data) + fd->ptr, bytes - zero_bytes);
+    }
+    else /* We're starting at or past size, so it'll all be zeroes */
+        zero_bytes = bytes;
+
+    memset(buf + (bytes - zero_bytes), 0, zero_bytes);
+
     fd->ptr += bytes;
 
     return bytes;
@@ -460,6 +468,11 @@ static ssize_t ramdisk_write(void *h, const void *buf, size_t bytes) {
         fd->file->datasize = (fd->ptr + bytes) + (rd_blksize * 4);
     }
 
+    /* If we started writing past a previous end of the file,
+       zero out the part between it and where we start writing. */
+    if(fd->ptr > fd->file->size)
+        memset(((uint8_t *)fd->file->data) + fd->file->size, 0, fd->ptr - fd->file->size);
+
     /* Copy out the requested amount */
     memcpy(((uint8_t *)fd->file->data) + fd->ptr, buf, bytes);
     fd->ptr += bytes;
@@ -474,6 +487,8 @@ static ssize_t ramdisk_write(void *h, const void *buf, size_t bytes) {
 /* Seek elsewhere in a file */
 static off_t ramdisk_seek(void *h, off_t offset, int whence) {
     rd_fd_t     *fd = h;
+    uint32_t    temp_ptr;
+    uint32_t    temp_size;
 
     mutex_lock_scoped(&rd_mutex);
 
@@ -483,6 +498,8 @@ static off_t ramdisk_seek(void *h, off_t offset, int whence) {
         return -1;
     }
 
+    temp_ptr = fd->ptr;
+
     /* Update current position according to arguments */
     switch(whence) {
         case SEEK_SET:
@@ -491,7 +508,7 @@ static off_t ramdisk_seek(void *h, off_t offset, int whence) {
                 return -1;
             }
 
-            fd->ptr = offset;
+            temp_ptr = offset;
             break;
 
         case SEEK_CUR:
@@ -500,7 +517,7 @@ static off_t ramdisk_seek(void *h, off_t offset, int whence) {
                 return -1;
             }
 
-            fd->ptr += offset;
+            temp_ptr += offset;
             break;
 
         case SEEK_END:
@@ -509,7 +526,7 @@ static off_t ramdisk_seek(void *h, off_t offset, int whence) {
                 return -1;
             }
 
-            fd->ptr = fd->file->size + offset;
+            temp_ptr = fd->file->size + offset;
             break;
 
         default:
@@ -517,9 +534,24 @@ static off_t ramdisk_seek(void *h, off_t offset, int whence) {
             return -1;
     }
 
-    /* Check bounds */
-    // XXXX: Technically this isn't correct. Fix it sometime.
-    if(fd->ptr > fd->file->size) fd->ptr = fd->file->size;
+    /* Check if we're seeking past the end of the file */
+    if(temp_ptr > fd->file->size) {
+        /* If we aren't open for writing, then this isn't valid to do */
+        if(fd->file->openfor != OPENFOR_WRITE) {
+            errno = EINVAL;
+            return -1;
+        }
+
+        /* Get where we want to write zeroes until */
+        temp_size = (fd->file->datasize < temp_ptr) ? fd->file->datasize : temp_ptr;
+
+        /* Since we're seeking past the end, lets zero out up to our allocation. */
+        memset(fd->file->data + fd->file->size, 0, temp_size - fd->file->size);
+        fd->file->size = temp_size;
+    }
+
+    /* We're good to write out */
+    fd->ptr = temp_ptr;
 
     return fd->ptr;
 }
